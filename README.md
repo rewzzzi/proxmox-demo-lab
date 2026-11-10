@@ -31,14 +31,14 @@
 
 ### Вариант 1: Установка через git
 ```bash
-git clone https://github.com/ВАШ_НИКНЕЙМ/proxmox-demo-lab.git /root/proxmox-demo-lab
+git clone https://github.com/rewzzzi/proxmox-demo-lab.git /root/proxmox-demo-lab
 cd /root/proxmox-demo-lab
 python3 demo-lab.py
 ```
 
 ### Вариант 2: Запуск одной строчкой
 ```bash
-curl -sSL https://raw.githubusercontent.com/ВАШ_НИКНЕЙМ/proxmox-demo-lab/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rewzzzi/proxmox-demo-lab/main/install.sh | bash
 ```
 
 ---
