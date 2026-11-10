@@ -20,7 +20,7 @@ INSTALL_DIR="/root/proxmox-demo-lab"
 
 if [ ! -d "$INSTALL_DIR" ]; then
     echo "[*] Клонирование репозитория..."
-    git clone https://github.com/ВАШ_НИКНЕЙМ/proxmox-demo-lab.git "$INSTALL_DIR"
+    git clone https://github.com/rewzzzi/proxmox-demo-lab.git "$INSTALL_DIR"
 else
     echo "[*] Обновление репозитория..."
     cd "$INSTALL_DIR" && git pull
