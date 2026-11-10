@@ -136,6 +136,8 @@ def get_unused_volume(vmid):
     return None
 
 def create_admin_templates(profile="base", storage="local-lvm"):
+    if not check_storage_space(storage):
+        return False
     base_tpl_id = 900 if profile == "base" else 910
     target_dir = CACHE_DIR if profile == "base" else CACHE_DIR / "module2"
     
@@ -254,6 +256,8 @@ def setup_student_bridges(student_id, prefix="1"):
     return bridges
 
 def deploy_single_module(student_id, mod_num, storage="local-lvm"):
+    if not check_storage_space(storage):
+        return False
     # mod_num: 1 (Стенд А) или 2 (Стенд B)
     mod_letter = "A" if mod_num == 1 else "B"
     tpl_base = 900 if mod_num == 1 else 910
@@ -384,29 +388,217 @@ def power_all_stands(start_id, end_id, mod_choice="all", action="stop"):
             run(f"qm {action} {vmid}", check=False)
     print(f"[✓] Команда {action} отправлена!")
 
+def check_storage_status(storage="local-lvm"):
+    """Возвращает информацию о свободном месте в хранилище (LVM-Thin или каталог)."""
+    try:
+        res = run("lvs --units g --noheadings -o vg_name,lv_name,data_percent,lv_size pve/data", check=False)
+        if res.returncode == 0 and res.stdout.strip():
+            parts = res.stdout.strip().split()
+            if len(parts) >= 4:
+                pct = float(parts[2].replace(',', '.'))
+                size_str = parts[3]
+                return {"type": "lvmthin", "used_pct": pct, "size": size_str}
+    except Exception:
+        pass
+    return None
+
+def check_storage_space(storage="local-lvm", warn_pct=88.0):
+    """Проверяет заполнение thin-pool перед созданием дисков."""
+    st = check_storage_status(storage)
+    if st and st["type"] == "lvmthin":
+        pct = st["used_pct"]
+        if pct >= warn_pct:
+            print(f"\n[!] ВНИМАНИЕ: хранилище {storage} заполнено на {pct:.1f}% (пул pve/data)!")
+            print("    Осталось мало места. При нехватке места Proxmox заблокирует запись на диски.")
+            try:
+                cont = input("Продолжить развертывание? [y/N]: ").strip().lower()
+                if cont != "y":
+                    return False
+            except Exception:
+                return False
+    return True
+
+def check_student_stand(target_input, mod_choice="all"):
+    """Диагностика стендов одного студента или группы:
+    Проверяет пулы, пользователей, права ACL, сетевые мосты, ВМ, диски и снимки.
+    """
+    try:
+        if "-" in str(target_input):
+            p1, p2 = str(target_input).split("-", 1)
+            start_id, end_id = int(p1.strip()), int(p2.strip())
+        else:
+            start_id = end_id = int(str(target_input).strip())
+    except Exception:
+        print("[!] Неверный ввод. Укажите номер студента (напр. 1) или диапазон (1-20).")
+        return
+
+    mods = []
+    if mod_choice in ["1", "A", "a", "all"]:
+        mods.append((1, "A", "Стенд А (Модуль 1)"))
+    if mod_choice in ["2", "B", "b", "all"]:
+        mods.append((2, "B", "Стенд B (Модуль 2)"))
+
+    # Если выбран диапазон студентов — сводная таблица
+    if start_id != end_id:
+        print("\n" + "="*78)
+        print(f" ГРУППОВАЯ ДИАГНОСТИКА СТЕНДОВ (Студенты с {start_id:02d} по {end_id:02d})")
+        print("="*78)
+        print(f" {'Студент':<10} | {'Модуль':<9} | {'Пул':<7} | {'Учетка':<7} | {'Мосты':<7} | {'ВМ (из 8)':<10} | {'Статус стенда'}")
+        print("-" * 78)
+        
+        for s in range(start_id, end_id + 1):
+            for mod_num, mod_letter, _ in mods:
+                pool = f"DE_09.02.06-2027_stand_{mod_letter}-{s}"
+                user = f"student{s:02d}-{mod_letter}@pve"
+                
+                pool_ok = (run(f"pveum pool list | grep '{pool}'", check=False).returncode == 0)
+                user_ok = (run(f"pveum user list | grep '{user}'", check=False).returncode == 0)
+                
+                b_ok = all(Path(f"/sys/class/net/vmbr{mod_num}{s:02d}{b}").exists() for b in range(1, 10))
+                
+                vms_ready = 0
+                vms_with_snap = 0
+                for idx in range(8):
+                    vmid = int(f"{mod_num}{s:02d}{idx+1:02d}")
+                    cfg = run(f"qm config {vmid}", check=False)
+                    if cfg.returncode == 0:
+                        vms_ready += 1
+                        snaps = run(f"qm listsnapshot {vmid}", check=False)
+                        if "lab-initial" in snaps.stdout:
+                            vms_with_snap += 1
+                
+                p_str = "[✓]" if pool_ok else "[✗]"
+                u_str = "[✓]" if user_ok else "[✗]"
+                b_str = "[✓]" if b_ok else "[!]"
+                vm_str = f"{vms_ready}/8"
+                
+                if vms_ready == 8 and vms_with_snap == 8 and pool_ok and user_ok:
+                    status_str = "[✓ ГОТОВ К СДАЧЕ]"
+                elif vms_ready == 0:
+                    status_str = "[НЕ РАЗВЕРНУТ]"
+                else:
+                    status_str = f"[! ЧАСТИЧНО: {vms_ready}/8 ВМ, {vms_with_snap}/8 снимков]"
+                    
+                print(f" Студент {s:02d} | Стенд {mod_letter}  | {p_str:^7} | {u_str:^7} | {b_str:^7} | {vm_str:^10} | {status_str}")
+        print("="*78 + "\n")
+        return
+
+    # Одиночный студент — подробный отчет
+    student_id = start_id
+    print("\n" + "="*80)
+    print(f" ПОДРОБНАЯ ДИАГНОСТИКА СТЕНДОВ: СТУДЕНТ {student_id:02d}")
+    print("="*80)
+    
+    st = check_storage_status()
+    if st and st["type"] == "lvmthin":
+        print(f" Хранилище local-lvm: занято {st['used_pct']:.1f}% пула pve/data (размер: {st['size']})")
+        
+    for mod_num, mod_letter, mod_name in mods:
+        pool = f"DE_09.02.06-2027_stand_{mod_letter}-{student_id}"
+        user = f"student{student_id:02d}-{mod_letter}@pve"
+        
+        print(f"\n>> {mod_name}:")
+        print("-" * 80)
+        
+        # 1. Пул
+        pool_check = run(f"pveum pool list | grep '{pool}'", check=False)
+        if pool_check.returncode == 0 and pool in pool_check.stdout:
+            print(f"  [✓] Пул ресурсов:    {pool} (существует)")
+        else:
+            print(f"  [✗] Пул ресурсов:    {pool} НЕ НАЙДЕН!")
+            
+        # 2. Пользователь и права
+        user_check = run(f"pveum user list | grep '{user}'", check=False)
+        if user_check.returncode == 0 and user in user_check.stdout:
+            acl_check = run("pveum acl list", check=False)
+            if pool in acl_check.stdout and user in acl_check.stdout:
+                print(f"  [✓] Учетная запись:  {user} (права PVEVMUser на пул активны)")
+            else:
+                print(f"  [!] Учетная запись:  {user} (есть, но права на пул не подтверждены)")
+        else:
+            print(f"  [✗] Учетная запись:  {user} НЕ НАЙДЕНА!")
+            
+        # 3. Сетевые мосты
+        bridge_prefix = f"vmbr{mod_num}{student_id:02d}"
+        missing_bridges = [f"{bridge_prefix}{b}" for b in range(1, 10) if not Path(f"/sys/class/net/{bridge_prefix}{b}").exists()]
+        if not missing_bridges:
+            print(f"  [✓] Сетевые мосты:   {bridge_prefix}1..{bridge_prefix}9 (все 9 активны)")
+        else:
+            print(f"  [!] Сетевые мосты:   отсутствуют {', '.join(missing_bridges)}")
+            
+        # 4. Виртуальные машины
+        print("\n  Состояние виртуальных машин:")
+        print("  " + "-" * 76)
+        print(f"  {'VMID':<7} | {'Имя ВМ':<14} | {'Тег (Цвет)':<11} | {'Статус':<8} | {'ОЗУ':<5} | {'Диск':<5} | {'Снимок lab-initial'}")
+        print("  " + "-" * 76)
+        
+        all_vms_ok = True
+        for idx, role in enumerate(ROLES):
+            vmid = int(f"{mod_num}{student_id:02d}{idx+1:02d}")
+            name = f"{mod_letter}-{role}-{student_id}"
+            tag = TAGS_MAP.get(role, "student")
+            
+            cfg_res = run(f"qm config {vmid}", check=False)
+            if cfg_res.returncode != 0:
+                print(f"  {vmid:<7} | {name:<14} | {tag:<11} | [НЕ СОЗДАНА]   |  -    |  -   | [✗] НЕТ ВМ")
+                all_vms_ok = False
+                continue
+                
+            cfg_lines = dict(line.split(": ", 1) for line in cfg_res.stdout.splitlines() if ": " in line)
+            status_res = run(f"qm status {vmid}", check=False)
+            vm_status = status_res.stdout.split(":")[-1].strip() if ":" in status_res.stdout else "stopped"
+            
+            ram = cfg_lines.get("memory", "?")
+            has_disk = any(k.startswith("scsi") or k.startswith("sata") or k.startswith("ide") or k.startswith("virtio") for k in cfg_lines.keys())
+            disk_str = "OK" if has_disk else "НЕТ"
+            
+            snaps_res = run(f"qm listsnapshot {vmid}", check=False)
+            has_snap = "lab-initial" in snaps_res.stdout
+            snap_str = "[✓] Создан" if has_snap else "[✗] НЕТ СНИМКА"
+            
+            print(f"  {vmid:<7} | {name:<14} | {tag:<11} | {vm_status:<8} | {ram:<5} | {disk_str:<5} | {snap_str}")
+            if not has_disk or not has_snap:
+                all_vms_ok = False
+                
+        print("  " + "-" * 76)
+        if all_vms_ok:
+            print(f"  [✓] {mod_name} ПОЛНОСТЬЮ ГОТОВ К ВЫДАЧЕ УЧАСТНИКУ!")
+        else:
+            print(f"  [!] В {mod_name} есть замечания (см. таблицу выше)")
+            
+    print("\n" + "=" * 80 + "\n")
+
 def main_menu():
     while True:
+        st = check_storage_status()
+        st_hdr = f"[Хранилище local-lvm: занято {st['used_pct']:.1f}% пула pve/data]" if st and st["type"] == "lvmthin" else ""
+        
         print("\n" + "="*65)
         print("    УПРАВЛЕНИЕ СТЕНДАМИ ДЕМОЭКЗАМЕНА (КИМ 09.02.06-1-2027)")
         print("         (Стенд А = Модуль 1 | Стенд B = Модуль 2)")
         print("="*65)
+        if st_hdr:
+            print(f" {st_hdr}")
+            print("-" * 65)
         print(" 1. СОЗДАТЬ/ОБНОВИТЬ ЭТАЛОННЫЕ ШАБЛОНЫ (900-907 / 910-917)")
         print(" 2. Развернуть стенды для ОДНОГО студента (Стенд А / B / Оба)")
-        print(" 3. МАССОВОЕ развертывание для группы 1-20 (А / B / Оба)")
+        print(" 3. МАССОВОЕ развертывание для группы (Стенд А / B / Оба)")
         print("-" * 65)
-        print(" 4. Создать контрольные снимки для ОДНОГО студента")
-        print(" 5. Создать контрольные снимки МАССОВО (для группы)")
+        print(" 4. Проверить стенды студента / группы (ДИАГНОСТИКА И СТАТУС)")
         print("-" * 65)
-        print(" 6. Сбросить стенд студента к снимку (Reset)")
-        print(" 7. Массовый сброс стендов группы (Reset группы)")
-        print(" 8. Выключить все машины группы (Stop all)")
-        print(" 9. Удалить стенды студента (ВМ, пулы, логины)")
-        print("10. Показать карточки логинов и паролей (credentials.txt)")
+        print(" 5. Создать контрольные снимки для ОДНОГО студента")
+        print(" 6. Создать контрольные снимки МАССОВО (для группы)")
+        print("-" * 65)
+        print(" 7. Сбросить стенд студента к снимку (Reset)")
+        print(" 8. Массовый сброс стендов группы (Reset группы)")
+        print(" 9. Выключить все машины группы (Stop all)")
+        print("10. Удалить стенды студента (ВМ, пулы, логины)")
+        print("11. Показать карточки логинов и паролей (credentials.txt)")
         print(" 0. Выход")
         print("="*65)
         
         try:
-            choice = input("Выберите пункт [0-10]: ").strip()
+            choice = input("Выберите пункт [0-11]: ").strip()
         except EOFError:
             break
         
@@ -427,35 +619,39 @@ def main_menu():
             for s in range(start_id, end_id + 1):
                 deploy_student_stands(s, mod)
         elif choice == "4":
+            target = input("Номер студента или диапазон (напр. 1 или 1-20): ").strip()
+            mod = input("Какой стенд проверить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
+            check_student_stand(target, mod)
+        elif choice == "5":
             s_id = int(input("Номер студента для снимка: "))
             mod = input("Какой стенд? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             take_snapshots(s_id, mod)
-        elif choice == "5":
+        elif choice == "6":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
             mod = input("Какой стенд? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             for s in range(start_id, end_id + 1):
                 take_snapshots(s, mod)
-        elif choice == "6":
+        elif choice == "7":
             s_id = int(input("Номер студента: "))
             mod = input("Какой стенд сбросить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             reset_student_stand(s_id, mod)
-        elif choice == "7":
+        elif choice == "8":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
             mod = input("Какой стенд сбросить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             for s in range(start_id, end_id + 1):
                 reset_student_stand(s, mod)
-        elif choice == "8":
+        elif choice == "9":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
             mod = input("Какой стенд выключить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             power_all_stands(start_id, end_id, mod, "stop")
-        elif choice == "9":
+        elif choice == "10":
             s_id = int(input("Номер студента для удаления: "))
             mod = input("Что удалить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             delete_student_stand(s_id, mod)
-        elif choice == "10":
+        elif choice == "11":
             if CREDS_FILE.exists():
                 print("\n" + "="*70)
                 print(" СПИСОК УЧЕТНЫХ ЗАПИСЕЙ СТУДЕНТОВ ДЕМОЭКЗАМЕНА")
