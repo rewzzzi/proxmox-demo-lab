@@ -6,13 +6,19 @@ import secrets
 import subprocess
 from pathlib import Path
 
+# Защита от UnicodeDecodeError в веб-консоли Proxmox
+if sys.version_info >= (3, 7):
+    try:
+        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 CACHE_DIR = Path("/var/lib/vz/demo-images")
 INTERFACES_FILE = Path("/etc/network/interfaces")
 CREDS_FILE = Path("/root/students_credentials.txt")
 
-# Google Drive ID для образов
-# Модуль 1: чистые базовые диски
-# Модуль 2: преднастроенные по спецификации КИМ 09.02.06-1-2027 (стр. 51-52)
 IMAGES = {
     "base": {
         "alt-jeos.qcow2": "1C9enJgehyHtHXaS24YbetS15XcBRw828",
@@ -36,6 +42,18 @@ IMAGES = {
 }
 
 ROLES = ["ISP", "HQ-RTR", "HQ-SW", "HQ-SRV", "HQ-CLI", "BR-RTR", "BR-FW", "BR-SRV"]
+
+# Цветные теги (кружочки-закладки в Proxmox)
+TAGS_MAP = {
+    "ISP": "router",
+    "HQ-RTR": "router",
+    "HQ-SW": "switch",
+    "HQ-SRV": "server",
+    "HQ-CLI": "client",
+    "BR-RTR": "router",
+    "BR-FW": "firewall",
+    "BR-SRV": "server"
+}
 
 def run(cmd, check=True):
     res = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -64,18 +82,30 @@ def fix_dns():
         if "77.88.8.8" not in content or "8.8.8.8" not in content:
             new_resolv = "nameserver 77.88.8.8\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n"
             resolv_path.write_text(new_resolv)
-    except Exception as e:
-        print(f"[!] Предупреждение проверки DNS: {e}")
+    except Exception:
+        pass
 
 def download_images(profile="base"):
     fix_dns()
     target_dir = CACHE_DIR if profile == "base" else CACHE_DIR / "module2"
     target_dir.mkdir(parents=True, exist_ok=True)
     
+    # Проверяем, есть ли уже все образы
+    all_present = True
+    for filename in IMAGES[profile].keys():
+        fpath = target_dir / filename
+        if not fpath.exists() or fpath.stat().st_size <= 1024:
+            all_present = False
+            break
+            
+    if all_present:
+        print(f"[*] Все образы {profile} уже присутствуют в кэше!")
+        return
+
     venv_dir = Path("/root/.demo-venv")
     if not (venv_dir / "bin" / "gdown").exists():
         print("[*] Установка зависимостей (python3-venv, gdown)...")
-        run("apt-get update -qq && apt-get install -y -qq python3-venv")
+        run("apt-get update -qq && apt-get install -y -qq python3-venv curl")
         run(f"python3 -m venv {venv_dir}")
         run(f"{venv_dir}/bin/pip install -q --upgrade 'gdown>=5.0.0'")
 
@@ -88,9 +118,14 @@ def download_images(profile="base"):
             print(f"  [+] Уже есть в кэше: {filename}")
         else:
             print(f"  [>] Скачивание: {filename}...")
-            # gdown 5.x: аргумент ID передается без флага --id
-            cmd = f"{gdown_bin} --continue --retries 5 {file_id} -O {file_path}"
-            run_live(cmd)
+            cmd = f"{gdown_bin} --continue --retries 3 {file_id} -O {file_path}"
+            res = run(cmd, check=False)
+            # Если gdown заблокирован Google по квоте — качаем через curl с confirm=t
+            if res.returncode != 0 or not file_path.exists() or file_path.stat().st_size <= 1024:
+                print(f"  [*] Прямое скачивание {filename} через curl...")
+                c_file = "/tmp/g_cookie.txt"
+                run(f"curl -c {c_file} -s -L 'https://drive.google.com/uc?id={file_id}&export=download' > /dev/null")
+                run_live(f"curl -b {c_file} -C - -L 'https://drive.usercontent.google.com/download?id={file_id}&confirm=t' -o {file_path}")
     print("[*] Образы готовы к использованию!\n")
 
 def get_unused_volume(vmid):
@@ -104,7 +139,7 @@ def create_admin_templates(profile="base", storage="local-lvm"):
     base_tpl_id = 900 if profile == "base" else 910
     target_dir = CACHE_DIR if profile == "base" else CACHE_DIR / "module2"
     
-    label = "Модуль 1 (Базовый чистый)" if profile == "base" else "Модуль 2 (Преднастроенный по КИМ)"
+    label = "Стенд А (Модуль 1)" if profile == "base" else "Стенд В (Модуль 2)"
     print(f"\n=======================================================")
     print(f" СОЗДАНИЕ ЭТАЛОННЫХ ШАБЛОНОВ: {label}")
     print(f" Диапазон VMID шаблонов: {base_tpl_id} – {base_tpl_id + 7}")
@@ -114,25 +149,25 @@ def create_admin_templates(profile="base", storage="local-lvm"):
     
     if profile == "base":
         vm_configs = [
-            {"name": "tpl-M1-ISP",    "ram": 1024, "cpu": 1, "img": "alt-jeos.qcow2",        "type": "jeos",      "net_count": 3},
-            {"name": "tpl-M1-HQ-RTR", "ram": 2048, "cpu": 2, "img": "EcoRouterOS.qcow2",     "type": "router",    "net_count": 3},
-            {"name": "tpl-M1-HQ-SW",  "ram": 1024, "cpu": 1, "img": "alt-jeos.qcow2",        "type": "jeos",      "net_count": 3},
-            {"name": "tpl-M1-HQ-SRV", "ram": 2048, "cpu": 1, "img": "alt-server.qcow2",      "type": "server",    "net_count": 1},
-            {"name": "tpl-M1-HQ-CLI", "ram": 2048, "cpu": 2, "img": "alt-workstation.qcow2", "type": "cli",       "net_count": 1},
-            {"name": "tpl-M1-BR-RTR", "ram": 2048, "cpu": 2, "img": "EcoRouterOS.qcow2",     "type": "router",    "net_count": 3},
-            {"name": "tpl-M1-BR-FW",  "ram": 6144, "cpu": 4, "img": "ideco.qcow2",           "type": "ideco",     "net_count": 2},
-            {"name": "tpl-M1-BR-SRV", "ram": 2048, "cpu": 1, "img": "alt-server.qcow2",      "type": "server",    "net_count": 1},
+            {"name": "tpl-A-ISP",    "ram": 1024, "cpu": 1, "img": "alt-jeos.qcow2",        "type": "jeos",      "net_count": 3},
+            {"name": "tpl-A-HQ-RTR", "ram": 2048, "cpu": 2, "img": "EcoRouterOS.qcow2",     "type": "router",    "net_count": 3},
+            {"name": "tpl-A-HQ-SW",  "ram": 1024, "cpu": 1, "img": "alt-jeos.qcow2",        "type": "jeos",      "net_count": 3},
+            {"name": "tpl-A-HQ-SRV", "ram": 2048, "cpu": 1, "img": "alt-server.qcow2",      "type": "server",    "net_count": 1},
+            {"name": "tpl-A-HQ-CLI", "ram": 2048, "cpu": 2, "img": "alt-workstation.qcow2", "type": "cli",       "net_count": 1},
+            {"name": "tpl-A-BR-RTR", "ram": 2048, "cpu": 2, "img": "EcoRouterOS.qcow2",     "type": "router",    "net_count": 3},
+            {"name": "tpl-A-BR-FW",  "ram": 6144, "cpu": 4, "img": "ideco.qcow2",           "type": "ideco",     "net_count": 2},
+            {"name": "tpl-A-BR-SRV", "ram": 2048, "cpu": 1, "img": "alt-server.qcow2",      "type": "server",    "net_count": 1},
         ]
     else:
         vm_configs = [
-            {"name": "tpl-M2-ISP",    "ram": 1024, "cpu": 1, "img": "isp.qcow2",     "type": "jeos",      "net_count": 3},
-            {"name": "tpl-M2-HQ-RTR", "ram": 2048, "cpu": 2, "img": "hq-rtr.qcow2",  "type": "router_m2", "net_count": 3},
-            {"name": "tpl-M2-HQ-SW",  "ram": 1024, "cpu": 1, "img": "hq-sw.qcow2",   "type": "jeos",      "net_count": 3},
-            {"name": "tpl-M2-HQ-SRV", "ram": 2048, "cpu": 1, "img": "hq-srv.qcow2",  "type": "server",    "net_count": 1},
-            {"name": "tpl-M2-HQ-CLI", "ram": 2048, "cpu": 2, "img": "hq-cli.qcow2",  "type": "cli",       "net_count": 1},
-            {"name": "tpl-M2-BR-RTR", "ram": 2048, "cpu": 2, "img": "br-rtr.qcow2",  "type": "router_m2", "net_count": 3},
-            {"name": "tpl-M2-BR-FW",  "ram": 6144, "cpu": 4, "img": "br-fw.qcow2",   "type": "ideco_m2",  "net_count": 2},
-            {"name": "tpl-M2-BR-SRV", "ram": 2048, "cpu": 1, "img": "br-srv.qcow2",  "type": "server",    "net_count": 1},
+            {"name": "tpl-B-ISP",    "ram": 1024, "cpu": 1, "img": "isp.qcow2",     "type": "jeos",      "net_count": 3},
+            {"name": "tpl-B-HQ-RTR", "ram": 2048, "cpu": 2, "img": "hq-rtr.qcow2",  "type": "router_m2", "net_count": 3},
+            {"name": "tpl-B-HQ-SW",  "ram": 1024, "cpu": 1, "img": "hq-sw.qcow2",   "type": "jeos",      "net_count": 3},
+            {"name": "tpl-B-HQ-SRV", "ram": 2048, "cpu": 1, "img": "hq-srv.qcow2",  "type": "server",    "net_count": 1},
+            {"name": "tpl-B-HQ-CLI", "ram": 2048, "cpu": 2, "img": "hq-cli.qcow2",  "type": "cli",       "net_count": 1},
+            {"name": "tpl-B-BR-RTR", "ram": 2048, "cpu": 2, "img": "br-rtr.qcow2",  "type": "router_m2", "net_count": 3},
+            {"name": "tpl-B-BR-FW",  "ram": 6144, "cpu": 4, "img": "br-fw.qcow2",   "type": "ideco_m2",  "net_count": 2},
+            {"name": "tpl-B-BR-SRV", "ram": 2048, "cpu": 1, "img": "br-srv.qcow2",  "type": "server",    "net_count": 1},
         ]
 
     for idx, cfg in enumerate(vm_configs):
@@ -188,11 +223,12 @@ def create_admin_templates(profile="base", storage="local-lvm"):
 
     print(f"\n[✓] Все 8 эталонных шаблонов готовы (VMID {base_tpl_id}–{base_tpl_id+7})!\n")
 
-def setup_user_and_pool(student_id, module_key, password):
-    user = f"student{student_id:02d}-{module_key}@pve"
-    pool = f"pool-student-{student_id:02d}-{module_key}"
-    run(f"pveum pool add {pool} --comment 'Lab Stand {module_key.upper()} for Student {student_id:02d}'", check=False)
-    run(f"pveum user add {user} --password '{password}' --comment 'Student {student_id:02d} ({module_key.upper()})'", check=False)
+def setup_user_and_pool(student_id, mod_letter, password):
+    user = f"student{student_id:02d}-{mod_letter}@pve"
+    pool = f"DE_09.02.06-2027_stand_{mod_letter}-{student_id}"
+    comment = f'Стенд участника демэкзамена "Сетевое и системное администрирование" {mod_letter}-{student_id}'
+    run(f"pveum pool add '{pool}' --comment '{comment}'", check=False)
+    run(f"pveum user add '{user}' --password '{password}' --comment 'Студент {student_id:02d} (Стенд {mod_letter})'", check=False)
     run(f"pveum acl modify /pool/{pool} -user {user} -role PVEVMUser", check=False)
     return user, pool
 
@@ -206,7 +242,7 @@ def setup_student_bridges(student_id, prefix="1"):
     new_blocks = []
     for b in bridges:
         if b not in content:
-            block = f"\n# demo-lab student {student_id:02d} (M{prefix})\nauto {b}\niface {b} inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n"
+            block = f"\n# demo-lab student {student_id:02d} (Stand {prefix})\nauto {b}\niface {b} inet manual\n    bridge-ports none\n    bridge-stp off\n    bridge-fd 0\n"
             new_blocks.append(block)
     
     if new_blocks:
@@ -217,9 +253,11 @@ def setup_student_bridges(student_id, prefix="1"):
             
     return bridges
 
-def deploy_single_module(student_id, mod_key, storage="local-lvm"):
-    tpl_base = 900 if mod_key == "m1" else 910
-    mod_name = "Модуль 1" if mod_key == "m1" else "Модуль 2"
+def deploy_single_module(student_id, mod_num, storage="local-lvm"):
+    # mod_num: 1 (Стенд А) или 2 (Стенд B)
+    mod_letter = "A" if mod_num == 1 else "B"
+    tpl_base = 900 if mod_num == 1 else 910
+    mod_name = f"Стенд {mod_letter} (Модуль {mod_num})"
     
     chk = run(f"qm status {tpl_base}", check=False)
     if chk.returncode != 0:
@@ -227,16 +265,15 @@ def deploy_single_module(student_id, mod_key, storage="local-lvm"):
         return False
 
     password = generate_password()
-    user, pool = setup_user_and_pool(student_id, mod_key, password)
-    br = setup_student_bridges(student_id, prefix="1" if mod_key == "m1" else "2")
+    user, pool = setup_user_and_pool(student_id, mod_letter, password)
+    br = setup_student_bridges(student_id, prefix=str(mod_num))
     uplink = "vmbr0"
     
-    base_vmid = 200 + (student_id - 1) * 20 + (0 if mod_key == "m1" else 10)
-    
     print(f"\n=======================================================")
-    print(f" [>] Развертывание {mod_name} для Студента {student_id:02d}")
-    print(f" Пул: {pool} | Логин: {user} | Пароль: {password}")
-    print(f" Диапазон VMID: {base_vmid} – {base_vmid+7}")
+    print(f" [>] Развертывание: {mod_name} для Студента {student_id:02d}")
+    print(f" Пул: {pool}")
+    print(f" Логин: {user} | Пароль: {password}")
+    print(f" Диапазон VMID: {mod_num}{student_id:02d}01 – {mod_num}{student_id:02d}08")
     print(f"=======================================================")
     
     network_map = [
@@ -252,27 +289,31 @@ def deploy_single_module(student_id, mod_key, storage="local-lvm"):
 
     for idx, role in enumerate(ROLES):
         tpl_id = tpl_base + idx
-        vmid = base_vmid + idx
-        print(f"  * Клонирование {role} (ID {vmid}) в {pool}...")
+        vmid = int(f"{mod_num}{student_id:02d}{idx+1:02d}")
+        tag = TAGS_MAP.get(role, "server")
+        print(f"  * Клонирование {role} (ID {vmid}) в пул {pool}...")
         
         run(f"qm stop {vmid} --skiplock 1", check=False)
         run(f"qm destroy {vmid} --purge 1 --skiplock 1", check=False)
         
         run(f"qm clone {tpl_id} {vmid} --name '{role}' --pool '{pool}' --description '{mod_name} студента {student_id:02d}'")
         
+        # Навешиваем тег для цветного кружочка (закладки) в Proxmox
+        run(f"qm set {vmid} --tags '{tag}'", check=False)
+        
         net_model = "e1000" if role in ["HQ-RTR", "BR-RTR"] else "virtio"
         for net_idx, bridge in enumerate(network_map[idx]):
             run(f"qm set {vmid} --net{net_idx} {net_model},bridge={bridge},firewall=0")
             
-        if mod_key == "m2" and role == "HQ-SRV":
-            print(f"    - Добавление двух накопителей по 1ГБ для RAID (стр. 52 КИМ)...")
+        if mod_num == 2 and role == "HQ-SRV":
+            print(f"    - Добавление двух дисков по 1ГБ для RAID (стр. 52 КИМ)...")
             run(f"qm set {vmid} --scsi1 {storage}:1", check=False)
             run(f"qm set {vmid} --scsi2 {storage}:1", check=False)
 
         run(f"qm snapshot {vmid} lab-initial --vmstate 0 --description 'Чистый стенд'")
 
     cred_entry = (
-        f"Студент {student_id:02d} | {mod_name} | Логин: {user} | Пароль: {password} | Пул: {pool} | VMID: {base_vmid}..{base_vmid+7}\n"
+        f"Студент {student_id:02d} | Стенд {mod_letter} | Логин: {user} | Пароль: {password} | Пул: {pool} | VMID: {mod_num}{student_id:02d}01..{mod_num}{student_id:02d}08\n"
     )
     with open(CREDS_FILE, "a") as f:
         f.write(cred_entry)
@@ -281,18 +322,17 @@ def deploy_single_module(student_id, mod_key, storage="local-lvm"):
     return True
 
 def deploy_student_stands(student_id, mod_choice="all", storage="local-lvm"):
-    if mod_choice in ["1", "all"]:
-        deploy_single_module(student_id, "m1", storage)
-    if mod_choice in ["2", "all"]:
-        deploy_single_module(student_id, "m2", storage)
+    if mod_choice in ["1", "A", "a", "all"]:
+        deploy_single_module(student_id, 1, storage)
+    if mod_choice in ["2", "B", "b", "all"]:
+        deploy_single_module(student_id, 2, storage)
 
 def take_snapshots(student_id, mod_choice="all", snap_name="lab-initial"):
-    base_vmid = 200 + (student_id - 1) * 20
     vmids = []
-    if mod_choice in ["1", "all"]:
-        vmids.extend([base_vmid + i for i in range(8)])
-    if mod_choice in ["2", "all"]:
-        vmids.extend([base_vmid + 10 + i for i in range(8)])
+    if mod_choice in ["1", "A", "a", "all"]:
+        vmids.extend([int(f"1{student_id:02d}{i+1:02d}") for i in range(8)])
+    if mod_choice in ["2", "B", "b", "all"]:
+        vmids.extend([int(f"2{student_id:02d}{i+1:02d}") for i in range(8)])
         
     print(f"[*] Создание снимка '{snap_name}' для Студента {student_id:02d}...")
     for vmid in vmids:
@@ -301,12 +341,11 @@ def take_snapshots(student_id, mod_choice="all", snap_name="lab-initial"):
     print(f"[✓] Снимки созданы!")
 
 def reset_student_stand(student_id, mod_choice="all", snap_name="lab-initial"):
-    base_vmid = 200 + (student_id - 1) * 20
     vmids = []
-    if mod_choice in ["1", "all"]:
-        vmids.extend([base_vmid + i for i in range(8)])
-    if mod_choice in ["2", "all"]:
-        vmids.extend([base_vmid + 10 + i for i in range(8)])
+    if mod_choice in ["1", "A", "a", "all"]:
+        vmids.extend([int(f"1{student_id:02d}{i+1:02d}") for i in range(8)])
+    if mod_choice in ["2", "B", "b", "all"]:
+        vmids.extend([int(f"2{student_id:02d}{i+1:02d}") for i in range(8)])
         
     print(f"[*] Сброс стенда Студента {student_id:02d} к снимку '{snap_name}'...")
     for vmid in vmids:
@@ -315,31 +354,32 @@ def reset_student_stand(student_id, mod_choice="all", snap_name="lab-initial"):
     print(f"[✓] Сброс завершен!")
 
 def delete_student_stand(student_id, mod_choice="all"):
-    base_vmid = 200 + (student_id - 1) * 20
     mods_to_del = []
-    if mod_choice in ["1", "all"]:
-        mods_to_del.append(("m1", base_vmid))
-    if mod_choice in ["2", "all"]:
-        mods_to_del.append(("m2", base_vmid + 10))
+    if mod_choice in ["1", "A", "a", "all"]:
+        mods_to_del.append((1, "A"))
+    if mod_choice in ["2", "B", "b", "all"]:
+        mods_to_del.append((2, "B"))
         
-    for k, v_start in mods_to_del:
-        print(f"[*] Удаление {k.upper()} Студента {student_id:02d}...")
+    for m_num, m_letter in mods_to_del:
+        pool = f"DE_09.02.06-2027_stand_{m_letter}-{student_id}"
+        user = f"student{student_id:02d}-{m_letter}@pve"
+        print(f"[*] Удаление Стенда {m_letter} Студента {student_id:02d}...")
         for i in range(8):
-            run(f"qm stop {v_start + i} --skiplock 1", check=False)
-            run(f"qm destroy {v_start + i} --purge 1 --skiplock 1", check=False)
-        run(f"pveum pool delete pool-student-{student_id:02d}-{k}", check=False)
-        run(f"pveum user delete student{student_id:02d}-{k}@pve", check=False)
+            vmid = int(f"{m_num}{student_id:02d}{i+1:02d}")
+            run(f"qm stop {vmid} --skiplock 1", check=False)
+            run(f"qm destroy {vmid} --purge 1 --skiplock 1", check=False)
+        run(f"pveum pool delete '{pool}'", check=False)
+        run(f"pveum user delete '{user}'", check=False)
     print(f"[✓] Удаление для студента {student_id:02d} завершено!")
 
 def power_all_stands(start_id, end_id, mod_choice="all", action="stop"):
     print(f"[*] Команда '{action}' для студентов с {start_id:02d} по {end_id:02d}...")
     for s in range(start_id, end_id + 1):
-        base_vmid = 200 + (s - 1) * 20
         vmids = []
-        if mod_choice in ["1", "all"]:
-            vmids.extend([base_vmid + i for i in range(8)])
-        if mod_choice in ["2", "all"]:
-            vmids.extend([base_vmid + 10 + i for i in range(8)])
+        if mod_choice in ["1", "A", "a", "all"]:
+            vmids.extend([int(f"1{s:02d}{i+1:02d}") for i in range(8)])
+        if mod_choice in ["2", "B", "b", "all"]:
+            vmids.extend([int(f"2{s:02d}{i+1:02d}") for i in range(8)])
         for vmid in vmids:
             run(f"qm {action} {vmid}", check=False)
     print(f"[✓] Команда {action} отправлена!")
@@ -348,11 +388,11 @@ def main_menu():
     while True:
         print("\n" + "="*65)
         print("    УПРАВЛЕНИЕ СТЕНДАМИ ДЕМОЭКЗАМЕНА (КИМ 09.02.06-1-2027)")
-        print("          (2 отдельных пула и логина на студента)")
+        print("         (Стенд А = Модуль 1 | Стенд B = Модуль 2)")
         print("="*65)
         print(" 1. СОЗДАТЬ/ОБНОВИТЬ ЭТАЛОННЫЕ ШАБЛОНЫ (900-907 / 910-917)")
-        print(" 2. Развернуть стенды для ОДНОГО студента (M1 / M2 / Оба)")
-        print(" 3. МАССОВОЕ развертывание для группы 1-20 (M1 / M2 / Оба)")
+        print(" 2. Развернуть стенды для ОДНОГО студента (Стенд А / B / Оба)")
+        print(" 3. МАССОВОЕ развертывание для группы 1-20 (А / B / Оба)")
         print("-" * 65)
         print(" 4. Создать контрольные снимки для ОДНОГО студента")
         print(" 5. Создать контрольные снимки МАССОВО (для группы)")
@@ -365,52 +405,55 @@ def main_menu():
         print(" 0. Выход")
         print("="*65)
         
-        choice = input("Выберите пункт [0-10]: ").strip()
+        try:
+            choice = input("Выберите пункт [0-10]: ").strip()
+        except EOFError:
+            break
         
         if choice == "1":
             print("\nВыберите профиль шаблонов:")
-            print(" 1 - Модуль 1 (Базовый, чистые ОС, VMID 900-907)")
-            print(" 2 - Модуль 2 (Преднастроенный по КИМ, VMID 910-917)")
+            print(" 1 - Стенд А / Модуль 1 (Базовый, чистые ОС, VMID 900-907)")
+            print(" 2 - Стенд В / Модуль 2 (Преднастроенный по КИМ, VMID 910-917)")
             p = input("Профиль [1/2]: ").strip()
             create_admin_templates("module2" if p == "2" else "base")
         elif choice == "2":
             s_id = int(input("Номер студента (1-50): "))
-            mod = input("Какой модуль развернуть? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд развернуть? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             deploy_student_stands(s_id, mod)
         elif choice == "3":
             start_id = int(input("С какого студента [напр. 1]: "))
             end_id = int(input("По какого студента [напр. 20]: "))
-            mod = input("Какой модуль развернуть? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд развернуть? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             for s in range(start_id, end_id + 1):
                 deploy_student_stands(s, mod)
         elif choice == "4":
             s_id = int(input("Номер студента для снимка: "))
-            mod = input("Какой модуль? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             take_snapshots(s_id, mod)
         elif choice == "5":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
-            mod = input("Какой модуль? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             for s in range(start_id, end_id + 1):
                 take_snapshots(s, mod)
         elif choice == "6":
             s_id = int(input("Номер студента: "))
-            mod = input("Какой модуль сбросить? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд сбросить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             reset_student_stand(s_id, mod)
         elif choice == "7":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
-            mod = input("Какой модуль сбросить? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд сбросить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             for s in range(start_id, end_id + 1):
                 reset_student_stand(s, mod)
         elif choice == "8":
             start_id = int(input("С какого студента: "))
             end_id = int(input("По какого студента: "))
-            mod = input("Какой модуль выключить? 1 - Модуль 1, 2 - Модуль 2, all - Оба [all]: ").strip() or "all"
+            mod = input("Какой стенд выключить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             power_all_stands(start_id, end_id, mod, "stop")
         elif choice == "9":
             s_id = int(input("Номер студента для удаления: "))
-            mod = input("Что удалить? 1 - Только Модуль 1, 2 - Только Модуль 2, all - Все [all]: ").strip() or "all"
+            mod = input("Что удалить? 1 - Стенд А, 2 - Стенд B, all - Оба [all]: ").strip() or "all"
             delete_student_stand(s_id, mod)
         elif choice == "10":
             if CREDS_FILE.exists():
