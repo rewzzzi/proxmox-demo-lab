@@ -230,7 +230,10 @@ def setup_user_and_pool(student_id, mod_letter, password):
     pool = f"DE_09.02.06-2027_stand_{mod_letter}-{student_id}"
     comment = f'Стенд участника демэкзамена "Сетевое и системное администрирование" {mod_letter}-{student_id}'
     run(f"pveum pool add '{pool}' --comment '{comment}'", check=False)
-    run(f"pveum user add '{user}' --password '{password}' --comment 'Студент {student_id:02d} (Стенд {mod_letter})'", check=False)
+    run(f"pveum user add '{user}' --comment 'Студент {student_id:02d} (Стенд {mod_letter})'", check=False)
+    # Установка пароля пользователя в realm @pve через API Proxmox (pvesh)
+    run(f"pvesh set /access/password --userid '{user}' --password '{password}'", check=False)
+    run(f"printf '%s\n%s\n' '{password}' '{password}' | pveum passwd '{user}'", check=False)
     run(f"pveum acl modify /pool/{pool} -user {user} -role PVEVMUser", check=False)
     return user, pool
 
